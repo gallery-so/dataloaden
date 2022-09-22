@@ -29,14 +29,18 @@ type {{.Name}}Config struct {
 
 	// MaxBatch will limit the maximum number of keys to send in one batch, 0 = not limit
 	MaxBatch int
+
+	// DisableCache will disable all caching (automatic and manual) for this dataloader
+	DisableCache bool
 }
 
-// New{{.Name}} creates a new {{.Name}} given a fetch, wait, and maxBatch
+// New{{.Name}} creates a new {{.Name}} given a fetch, wait, maxBatch, and disableCache
 func New{{.Name}}(config {{.Name}}Config) *{{.Name}} {
 	return &{{.Name}}{
 		fetch: config.Fetch,
 		wait: config.Wait,
 		maxBatch: config.MaxBatch,
+		disableCache: config.DisableCache,
 	}
 }
 
@@ -50,6 +54,9 @@ type {{.Name}} struct {
 
 	// this will limit the maximum number of keys to send in one batch, 0 = no limit
 	maxBatch int
+
+	// whether this dataloader will cache values
+	disableCache bool
 
 	// INTERNAL
 
@@ -82,10 +89,12 @@ func (l *{{.Name}}) Load(key {{.KeyType.String}}) ({{.ValType.String}}, error) {
 // different data loaders without blocking until the thunk is called.
 func (l *{{.Name}}) LoadThunk(key {{.KeyType.String}}) func() ({{.ValType.String}}, error) {
 	l.mu.Lock()
-	if it, ok := l.cache[key]; ok {
-		l.mu.Unlock()
-		return func() ({{.ValType.String}}, error) {
-			return it, nil
+	if !l.disableCache {
+		if it, ok := l.cache[key]; ok {
+			l.mu.Unlock()
+			return func() ({{.ValType.String}}, error) {
+				return it, nil
+			}
 		}
 	}
 	if l.batch == nil {
@@ -111,7 +120,7 @@ func (l *{{.Name}}) LoadThunk(key {{.KeyType.String}}) func() ({{.ValType.String
 			err = batch.error[pos]
 		}
 
-		if err == nil {
+		if err == nil && !l.disableCache {
 			l.mu.Lock()
 			l.unsafeSet(key, data)
 			l.mu.Unlock()
@@ -160,6 +169,9 @@ func (l *{{.Name}}) LoadAllThunk(keys []{{.KeyType}}) (func() ([]{{.ValType.Stri
 // and false is returned.
 // (To forcefully prime the cache, clear the key first with loader.clear(key).prime(key, value).)
 func (l *{{.Name}}) Prime(key {{.KeyType}}, value {{.ValType.String}}) bool {
+	if l.disableCache {
+		return false
+	}
 	l.mu.Lock()
 	var found bool
 	if _, found = l.cache[key]; !found {
@@ -184,6 +196,9 @@ func (l *{{.Name}}) Prime(key {{.KeyType}}, value {{.ValType.String}}) bool {
 
 // Clear the value at key from the cache, if it exists
 func (l *{{.Name}}) Clear(key {{.KeyType}}) {
+	if l.disableCache {
+		return
+	}
 	l.mu.Lock()
 	delete(l.cache, key)
 	l.mu.Unlock()
