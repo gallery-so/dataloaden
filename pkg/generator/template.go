@@ -14,40 +14,77 @@ package {{.Package}}
 import (
     "sync"
     "time"
+	"context"
 
     {{if .KeyType.ImportPath}}"{{.KeyType.ImportPath}}"{{end}}
     {{if .ValType.ImportPath}}"{{.ValType.ImportPath}}"{{end}}
 )
 
-// {{.Name}}Config captures the config to create a new {{.Name}}
-type {{.Name}}Config struct {
-	// Fetch is a method that provides the data for the loader 
-	Fetch func(keys []{{.KeyType.String}}) ([]{{.ValType.String}}, []error)
-
-	// Wait is how long wait before sending a batch
-	Wait time.Duration
-
-	// MaxBatch will limit the maximum number of keys to send in one batch, 0 = not limit
-	MaxBatch int
-
-	// DisableCache will disable all caching (automatic and manual) for this dataloader
-	DisableCache bool
+type {{.Name}}Settings interface {
+	getWait() time.Duration
+	getMaxBatchOne() int
+	getMaxBatchMany() int
+	getDisableCache() bool
 }
 
-// New{{.Name}} creates a new {{.Name}} given a fetch, wait, maxBatch, and disableCache
-func New{{.Name}}(config {{.Name}}Config) *{{.Name}} {
-	return &{{.Name}}{
-		fetch: config.Fetch,
-		wait: config.Wait,
-		maxBatch: config.MaxBatch,
-		disableCache: config.DisableCache,
+// {{.Name}}Funcs captures the functions required to fetch and cache data
+type {{.Name}}Funcs struct {
+	// Fetch is a function that provides the data for the loader 
+	Fetch func(ctx context.Context, keys []{{.KeyType.String}}) ([]{{.ValType.String}}, []error)
+
+	// CacheKey is a function that returns the {{.KeyType.String}} cache key for a {{.ValType.String}}. If a CacheKey is not supplied,
+	// this loader will not automatically cache results from other loaders that return a {{.ValType.String}}.
+	CacheKey func({{.ValType.String}}) {{.KeyType.String}}
+}
+
+func (l *{{.Name}}) setWait(wait time.Duration) {
+	l.wait = wait
+}
+
+func (l *{{.Name}}) setMaxBatch(maxBatch int) {
+	l.maxBatch = maxBatch
+}
+
+func (l *{{.Name}}) setDisableCache(disableCache bool) {
+	l.disableCache = disableCache
+}
+
+// New{{.Name}} creates a new {{.Name}} with the given settings, functions, and options
+func New{{.Name}}(
+	ctx context.Context, settings {{.Name}}Settings,
+	funcs {{.Name}}Funcs,
+	opts ...func(interface{
+		setWait(time.Duration)
+		setMaxBatch(int)
+		setDisableCache(bool)
+	}),
+	) *{{.Name}} {
+	loader := &{{.Name}}{
+		fetch: func(keys []{{.KeyType.String}}) ([]{{.ValType.String}}, []error) { return funcs.Fetch(ctx, keys) },
+		cacheKey: funcs.CacheKey,
+		wait: settings.getWait(),
+		disableCache: settings.getDisableCache(),
+		{{- if .ValType.IsSlice }}
+		maxBatch: settings.getMaxBatchMany(),
+		{{- else }}
+		maxBatch: settings.getMaxBatchOne(),
+		{{- end }}
 	}
+
+	for _, opt := range opts {
+		opt(loader)
+	}
+
+	return loader
 }
 
 // {{.Name}} batches and caches requests          
 type {{.Name}} struct {
 	// this method provides the data for the loader
 	fetch func(keys []{{.KeyType.String}}) ([]{{.ValType.String}}, []error)
+
+	// this method gets a cache key for the given value type
+	cacheKey func({{.ValType.String}}) {{.KeyType.String}}
 
 	// how long to done before sending a batch
 	wait time.Duration
