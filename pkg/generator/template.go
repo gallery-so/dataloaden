@@ -24,7 +24,9 @@ type {{.Name}}Settings interface {
 	getWait() time.Duration
 	getMaxBatchOne() int
 	getMaxBatchMany() int
-	getDisableCache() bool
+	getDisableCaching() bool
+	getPublishResults() bool
+	getSubscriptionRegistry() *[]interface{}
 }
 
 // {{.Name}}Funcs captures the functions required to fetch and cache data
@@ -32,9 +34,12 @@ type {{.Name}}Funcs struct {
 	// Fetch is a function that provides the data for the loader 
 	Fetch func(ctx context.Context, keys []{{.KeyType.String}}) ([]{{.ValType.String}}, []error)
 
-	// CacheKey is a function that returns the {{.KeyType.String}} cache key for a {{.ValType.String}}. If a CacheKey is not supplied,
-	// this loader will not automatically cache results from other loaders that return a {{.ValType.String}}.
-	CacheKey func({{.ValType.String}}) {{.KeyType.String}}
+	{{- if not .ValType.IsSlice }}
+	// CachePublishedResultsWithKey is a function that returns the {{.KeyType.String}} cache key for a {{.ValType.String}}.
+	// If CachePublishedResultsWithKey is not nil, this loader will automatically cache published results from other loaders
+	// that return a {{.ValType.String}}, using this function to determine the key to cache the value with.
+	CachePublishedResultsWithKey func({{.ValType.String}}) {{.KeyType.String}}
+	{{- end }}
 }
 
 func (l *{{.Name}}) setWait(wait time.Duration) {
@@ -45,8 +50,12 @@ func (l *{{.Name}}) setMaxBatch(maxBatch int) {
 	l.maxBatch = maxBatch
 }
 
-func (l *{{.Name}}) setDisableCache(disableCache bool) {
-	l.disableCache = disableCache
+func (l *{{.Name}}) setDisableCaching(disableCaching bool) {
+	l.disableCaching = disableCaching
+}
+
+func (l *{{.Name}}) setPublishResults(publishResults bool) {
+	l.publishResults = publishResults
 }
 
 // New{{.Name}} creates a new {{.Name}} with the given settings, functions, and options
@@ -56,14 +65,16 @@ func New{{.Name}}(
 	opts ...func(interface{
 		setWait(time.Duration)
 		setMaxBatch(int)
-		setDisableCache(bool)
+		setDisableCaching(bool)
+		setPublishResults(bool)
 	}),
 	) *{{.Name}} {
 	loader := &{{.Name}}{
 		fetch: func(keys []{{.KeyType.String}}) ([]{{.ValType.String}}, []error) { return funcs.Fetch(ctx, keys) },
-		cacheKey: funcs.CacheKey,
 		wait: settings.getWait(),
-		disableCache: settings.getDisableCache(),
+		disableCaching: settings.getDisableCaching(),
+		publishResults: settings.getPublishResults(),
+		subscriptionRegistry: settings.getSubscriptionRegistry(),
 		{{- if .ValType.IsSlice }}
 		maxBatch: settings.getMaxBatchMany(),
 		{{- else }}
@@ -75,6 +86,48 @@ func New{{.Name}}(
 		opt(loader)
 	}
 
+	if loader.subscriptionRegistry == nil {
+		panic("subscriptionRegistry may not be nil")
+	}
+
+	{{ if .ValType.IsSlice }}
+	// No cache functions here; caching isn't very useful for dataloaders that return slices. This dataloader can
+	// still send its results to other cache-priming receivers, but it won't register its own cache-priming function.
+	{{- else }}
+	if !loader.disableCaching && funcs.CachePublishedResultsWithKey != nil {
+		cacheFunc := func(t {{.ValType.String}}) { loader.Prime(funcs.CachePublishedResultsWithKey(t), t)}
+		loader.cacheFunc = &cacheFunc
+		*loader.subscriptionRegistry = append(*loader.subscriptionRegistry, loader.cacheFunc)
+
+		// If we're caching many entries, only acquire the lock once
+		cacheManyFunc := func(t []{{.ValType.String}}) {
+			loader.mu.Lock()
+			for _, value := range t {
+				key := funcs.CachePublishedResultsWithKey(value)
+				if _, found := loader.cache[key]; !found {
+				{{- if .ValType.IsPtr }}
+					// make a copy when writing to the cache, its easy to pass a pointer in from a loop var
+					// and end up with the whole cache pointing to the same value.
+					cpy := *value
+					loader.unsafeSet(key, &cpy)
+				{{- else if .ValType.IsSlice }}
+					// make a copy when writing to the cache, its easy to pass a pointer in from a loop var
+					// and end up with the whole cache pointing to the same value.
+					cpy := make({{.ValType.String}}, len(value))
+					copy(cpy, value)
+					loader.unsafeSet(key, cpy)
+				{{- else }}
+					loader.unsafeSet(key, value)
+				{{- end }}
+				}
+			}
+			loader.mu.Unlock()
+		}
+		loader.cacheManyFunc = &cacheManyFunc
+		*loader.subscriptionRegistry = append(*loader.subscriptionRegistry, loader.cacheManyFunc)
+	}
+	{{- end }}
+
 	return loader
 }
 
@@ -83,22 +136,33 @@ type {{.Name}} struct {
 	// this method provides the data for the loader
 	fetch func(keys []{{.KeyType.String}}) ([]{{.ValType.String}}, []error)
 
-	// this method gets a cache key for the given value type
-	cacheKey func({{.ValType.String}}) {{.KeyType.String}}
-
-	// how long to done before sending a batch
+	// how long to wait before sending a batch
 	wait time.Duration
 
 	// this will limit the maximum number of keys to send in one batch, 0 = no limit
 	maxBatch int
 
-	// whether this dataloader will cache values
-	disableCache bool
+	// whether this dataloader will cache results
+	disableCaching bool
+
+	// whether this dataloader will publish its results for others to cache
+	publishResults bool
+
+	// a shared slice where dataloaders will register and invoke caching functions.
+	// the same slice should be passed to every dataloader.
+	subscriptionRegistry *[]interface{}
 
 	// INTERNAL
 
 	// lazily created cache
 	cache map[{{.KeyType.String}}]{{.ValType.String}}
+
+	// typed cache functions
+	subscribers []func({{.ValType.String}})
+
+	// functions used to cache published results from other dataloaders
+	cacheFunc *func(t {{.ValType.String}})
+	cacheManyFunc *func(t []{{.ValType.String}})
 
 	// the current batch. keys will continue to be collected until timeout is hit,
 	// then everything will be sent to the fetch method and out to the listeners
@@ -106,6 +170,9 @@ type {{.Name}} struct {
 
 	// mutex to prevent races
 	mu sync.Mutex
+
+	// only initialize our typed subscription cache once
+	once sync.Once
 }
 
 type {{.Name|lcFirst}}Batch struct {
@@ -126,7 +193,7 @@ func (l *{{.Name}}) Load(key {{.KeyType.String}}) ({{.ValType.String}}, error) {
 // different data loaders without blocking until the thunk is called.
 func (l *{{.Name}}) LoadThunk(key {{.KeyType.String}}) func() ({{.ValType.String}}, error) {
 	l.mu.Lock()
-	if !l.disableCache {
+	if !l.disableCaching {
 		if it, ok := l.cache[key]; ok {
 			l.mu.Unlock()
 			return func() ({{.ValType.String}}, error) {
@@ -157,10 +224,16 @@ func (l *{{.Name}}) LoadThunk(key {{.KeyType.String}}) func() ({{.ValType.String
 			err = batch.error[pos]
 		}
 
-		if err == nil && !l.disableCache {
-			l.mu.Lock()
-			l.unsafeSet(key, data)
-			l.mu.Unlock()
+		if err == nil {
+			if !l.disableCaching {
+				l.mu.Lock()
+				l.unsafeSet(key, data)
+				l.mu.Unlock()
+			}
+
+			if l.publishResults {
+				l.publishToSubscribers(data)
+			}
 		}
 
 		return data, err
@@ -206,7 +279,7 @@ func (l *{{.Name}}) LoadAllThunk(keys []{{.KeyType}}) (func() ([]{{.ValType.Stri
 // and false is returned.
 // (To forcefully prime the cache, clear the key first with loader.clear(key).prime(key, value).)
 func (l *{{.Name}}) Prime(key {{.KeyType}}, value {{.ValType.String}}) bool {
-	if l.disableCache {
+	if l.disableCaching {
 		return false
 	}
 	l.mu.Lock()
@@ -233,7 +306,7 @@ func (l *{{.Name}}) Prime(key {{.KeyType}}, value {{.ValType.String}}) bool {
 
 // Clear the value at key from the cache, if it exists
 func (l *{{.Name}}) Clear(key {{.KeyType}}) {
-	if l.disableCache {
+	if l.disableCaching {
 		return
 	}
 	l.mu.Lock()
@@ -293,5 +366,23 @@ func (b *{{.Name|lcFirst}}Batch) startTimer(l *{{.Name}}) {
 func (b *{{.Name|lcFirst}}Batch) end(l *{{.Name}}) {
 	b.data, b.error = l.fetch(b.keys)
 	close(b.done)
+}
+
+func (l *{{.Name}}) publishToSubscribers(value {{.ValType.String}}) {
+	// Lazy build our list of typed cache functions once
+	l.once.Do(func() {
+		for _, subscription := range *l.subscriptionRegistry {
+			if typedFunc, ok := subscription.(*func({{.ValType.String}})); ok {
+				// Don't invoke our own cache function
+				if typedFunc != l.cacheFunc {
+					l.subscribers = append(l.subscribers, *typedFunc)
+				}
+			}
+		}
+	})
+
+	for _, f := range l.subscribers {
+		f(value)
+	}
 }
 `))
