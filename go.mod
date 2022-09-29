@@ -1,4 +1,4 @@
-module github.com/go-gallery/dataloaden
+module github.com/gallery-so/dataloaden
 
 go 1.16
 

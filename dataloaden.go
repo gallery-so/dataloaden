@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/go-gallery/dataloaden/pkg/generator"
+	"github.com/gallery-so/dataloaden/pkg/generator"
 )
 
 func main() {
