@@ -36,12 +36,24 @@ func (t *goType) String() string {
 	return t.Modifiers + t.Name
 }
 
+func (t *goType) StringWithoutModifiers() string {
+	if t.ImportName != "" {
+		return t.ImportName + "." + t.Name
+	}
+
+	return t.Name
+}
+
 func (t *goType) IsPtr() bool {
 	return strings.HasPrefix(t.Modifiers, "*")
 }
 
 func (t *goType) IsSlice() bool {
 	return strings.HasPrefix(t.Modifiers, "[]")
+}
+
+func (t *goType) IsSliceOfPtrs() bool {
+	return strings.HasPrefix(t.Modifiers, "[]*")
 }
 
 var partsRe = regexp.MustCompile(`^([\[\]\*]*)(.*?)(\.\w*)?$`)

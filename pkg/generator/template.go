@@ -21,25 +21,45 @@ import (
 )
 
 type {{.Name}}Settings interface {
+	getContext() context.Context
 	getWait() time.Duration
 	getMaxBatchOne() int
 	getMaxBatchMany() int
 	getDisableCaching() bool
 	getPublishResults() bool
 	getSubscriptionRegistry() *[]interface{}
+	getMutexRegistry() *[]*sync.Mutex
 }
 
-// {{.Name}}Funcs captures the functions required to fetch and cache data
-type {{.Name}}Funcs struct {
-	// Fetch is a function that provides the data for the loader 
-	Fetch func(ctx context.Context, keys []{{.KeyType.String}}) ([]{{.ValType.String}}, []error)
+{{- if not .ValType.IsSlice }}
+// {{.Name}}CacheSubscriptions 
+type {{.Name}}CacheSubscriptions struct {
+	// AutoCacheWithKey is a function that returns the {{.KeyType.String}} cache key for a {{.ValType.StringWithoutModifiers}}.
+	// If AutoCacheWithKey is not nil, this loader will automatically cache published results from other loaders
+	// that return a {{.ValType.StringWithoutModifiers}}. Loaders that return pointers or slices of {{.ValType.StringWithoutModifiers}}
+	// will be dereferenced/iterated automatically, invoking this function with the base {{.ValType.StringWithoutModifiers}} type.
+	AutoCacheWithKey func({{.ValType.StringWithoutModifiers}}) {{.KeyType.String}}
 
-	{{- if not .ValType.IsSlice }}
-	// CachePublishedResultsWithKey is a function that returns the {{.KeyType.String}} cache key for a {{.ValType.String}}.
-	// If CachePublishedResultsWithKey is not nil, this loader will automatically cache published results from other loaders
-	// that return a {{.ValType.String}}, using this function to determine the key to cache the value with.
-	CachePublishedResultsWithKey func({{.ValType.String}}) {{.KeyType.String}}
-	{{- end }}
+	// AutoCacheWithKeys is a function that returns the []{{.KeyType.String}} cache keys for a {{.ValType.StringWithoutModifiers}}.
+	// Similar to AutoCacheWithKey, but for cases where a single value gets cached by many keys.
+	// If AutoCacheWithKeys is not nil, this loader will automatically cache published results from other loaders
+	// that return a {{.ValType.StringWithoutModifiers}}. Loaders that return pointers or slices of {{.ValType.StringWithoutModifiers}}
+	// will be dereferenced/iterated automatically, invoking this function with the base {{.ValType.StringWithoutModifiers}} type.
+	AutoCacheWithKeys func({{.ValType.StringWithoutModifiers}}) []{{.KeyType.String}}
+
+	// TODO: Allow custom cache functions once we're able to use generics. It could be done without generics, but
+	// would be messy and error-prone. A non-generic implementation might look something like:
+	//
+	//   CustomCacheFuncs []func(primeFunc func(key, value)) func(typeToRegisterFor interface{})
+	//
+	// where each CustomCacheFunc is a closure that receives this loader's unsafePrime method and returns a
+	// function that accepts the type it's registering for and uses that type and the unsafePrime method
+	// to prime the cache.
+}
+{{- end }}
+
+func (l *{{.Name}}) setContext(ctx context.Context) {
+	l.ctx = ctx
 }
 
 func (l *{{.Name}}) setWait(wait time.Duration) {
@@ -60,9 +80,12 @@ func (l *{{.Name}}) setPublishResults(publishResults bool) {
 
 // New{{.Name}} creates a new {{.Name}} with the given settings, functions, and options
 func New{{.Name}}(
-	ctx context.Context, settings {{.Name}}Settings,
-	funcs {{.Name}}Funcs,
+	settings {{.Name}}Settings, fetch func(ctx context.Context, keys []{{.KeyType.String}}) ([]{{.ValType.String}}, []error),
+	{{- if not .ValType.IsSlice }}
+	funcs {{.Name}}CacheSubscriptions,
+	{{- end }}
 	opts ...func(interface{
+		setContext(context.Context)
 		setWait(time.Duration)
 		setMaxBatch(int)
 		setDisableCaching(bool)
@@ -70,11 +93,12 @@ func New{{.Name}}(
 	}),
 	) *{{.Name}} {
 	loader := &{{.Name}}{
-		fetch: func(keys []{{.KeyType.String}}) ([]{{.ValType.String}}, []error) { return funcs.Fetch(ctx, keys) },
+		ctx: settings.getContext(),
 		wait: settings.getWait(),
 		disableCaching: settings.getDisableCaching(),
 		publishResults: settings.getPublishResults(),
 		subscriptionRegistry: settings.getSubscriptionRegistry(),
+		mutexRegistry: settings.getMutexRegistry(),
 		{{- if .ValType.IsSlice }}
 		maxBatch: settings.getMaxBatchMany(),
 		{{- else }}
@@ -86,45 +110,40 @@ func New{{.Name}}(
 		opt(loader)
 	}
 
+	// Set this after applying options, in case a different context was set via options
+	loader.fetch = func(keys []{{.KeyType.String}}) ([]{{.ValType.String}}, []error) { return fetch(loader.ctx, keys) }
+
 	if loader.subscriptionRegistry == nil {
 		panic("subscriptionRegistry may not be nil")
+	}
+
+	if loader.mutexRegistry == nil {
+		panic("mutexRegistry may not be nil")
 	}
 
 	{{ if .ValType.IsSlice }}
 	// No cache functions here; caching isn't very useful for dataloaders that return slices. This dataloader can
 	// still send its results to other cache-priming receivers, but it won't register its own cache-priming function.
 	{{- else }}
-	if !loader.disableCaching && funcs.CachePublishedResultsWithKey != nil {
-		cacheFunc := func(t {{.ValType.String}}) { loader.Prime(funcs.CachePublishedResultsWithKey(t), t)}
-		loader.cacheFunc = &cacheFunc
-		*loader.subscriptionRegistry = append(*loader.subscriptionRegistry, loader.cacheFunc)
+	if !loader.disableCaching {
+		// One-to-one mappings: cache one value with one key
+		if funcs.AutoCacheWithKey != nil {
+			cacheFunc := func(t {{.ValType.StringWithoutModifiers}}) {
+				loader.unsafePrime(funcs.AutoCacheWithKey(t), t)
+			}
+			loader.registerCacheFunc(&cacheFunc, &loader.mu)
+		}
 
-		// If we're caching many entries, only acquire the lock once
-		cacheManyFunc := func(t []{{.ValType.String}}) {
-			loader.mu.Lock()
-			for _, value := range t {
-				key := funcs.CachePublishedResultsWithKey(value)
-				if _, found := loader.cache[key]; !found {
-				{{- if .ValType.IsPtr }}
-					// make a copy when writing to the cache, its easy to pass a pointer in from a loop var
-					// and end up with the whole cache pointing to the same value.
-					cpy := *value
-					loader.unsafeSet(key, &cpy)
-				{{- else if .ValType.IsSlice }}
-					// make a copy when writing to the cache, its easy to pass a pointer in from a loop var
-					// and end up with the whole cache pointing to the same value.
-					cpy := make({{.ValType.String}}, len(value))
-					copy(cpy, value)
-					loader.unsafeSet(key, cpy)
-				{{- else }}
-					loader.unsafeSet(key, value)
-				{{- end }}
+		// One-to-many mappings: cache one value with many keys
+		if funcs.AutoCacheWithKeys != nil {
+			cacheFunc := func(t {{.ValType.StringWithoutModifiers}}) {
+				keys := funcs.AutoCacheWithKeys(t)
+				for _, key := range keys {
+					loader.unsafePrime(key, t)
 				}
 			}
-			loader.mu.Unlock()
+			loader.registerCacheFunc(&cacheFunc, &loader.mu)
 		}
-		loader.cacheManyFunc = &cacheManyFunc
-		*loader.subscriptionRegistry = append(*loader.subscriptionRegistry, loader.cacheManyFunc)
 	}
 	{{- end }}
 
@@ -133,6 +152,9 @@ func New{{.Name}}(
 
 // {{.Name}} batches and caches requests          
 type {{.Name}} struct {
+	// context passed to fetch functions
+	ctx context.Context
+
 	// this method provides the data for the loader
 	fetch func(keys []{{.KeyType.String}}) ([]{{.ValType.String}}, []error)
 
@@ -152,17 +174,21 @@ type {{.Name}} struct {
 	// the same slice should be passed to every dataloader.
 	subscriptionRegistry *[]interface{}
 
+	// a shared slice, parallel to the subscription registry, that holds a reference to the
+	// cache mutex for the subscription's dataloader
+	mutexRegistry *[]*sync.Mutex
+
 	// INTERNAL
 
 	// lazily created cache
 	cache map[{{.KeyType.String}}]{{.ValType.String}}
 
 	// typed cache functions
-	subscribers []func({{.ValType.String}})
+	//subscribers []func({{.ValType.String}})
+	subscribers []{{.Name|lcFirst}}Subscriber
 
 	// functions used to cache published results from other dataloaders
-	cacheFunc *func(t {{.ValType.String}})
-	cacheManyFunc *func(t []{{.ValType.String}})
+	cacheFuncs []interface{}
 
 	// the current batch. keys will continue to be collected until timeout is hit,
 	// then everything will be sent to the fetch method and out to the listeners
@@ -304,6 +330,24 @@ func (l *{{.Name}}) Prime(key {{.KeyType}}, value {{.ValType.String}}) bool {
 	return !found
 }
 
+{{- if not .ValType.IsSlice }}
+// Prime the cache without acquiring locks. Should only be used when the lock is already held.
+func (l *{{.Name}}) unsafePrime(key {{.KeyType}}, value {{.ValType.StringWithoutModifiers}}) bool {
+	if l.disableCaching {
+		return false
+	}
+	var found bool
+	if _, found = l.cache[key]; !found {
+		{{- if .ValType.IsPtr }}
+			l.unsafeSet(key, &value)
+		{{- else }}
+			l.unsafeSet(key, value)
+		{{- end }}
+	}
+	return !found
+}
+{{- end }}
+
 // Clear the value at key from the cache, if it exists
 func (l *{{.Name}}) Clear(key {{.KeyType}}) {
 	if l.disableCaching {
@@ -368,21 +412,63 @@ func (b *{{.Name|lcFirst}}Batch) end(l *{{.Name}}) {
 	close(b.done)
 }
 
+type {{.Name|lcFirst}}Subscriber struct {
+	cacheFunc func({{.ValType.StringWithoutModifiers}})
+	mutex *sync.Mutex
+}
+
 func (l *{{.Name}}) publishToSubscribers(value {{.ValType.String}}) {
 	// Lazy build our list of typed cache functions once
 	l.once.Do(func() {
-		for _, subscription := range *l.subscriptionRegistry {
-			if typedFunc, ok := subscription.(*func({{.ValType.String}})); ok {
+		for i, subscription := range *l.subscriptionRegistry {
+			if typedFunc, ok := subscription.(*func({{.ValType.StringWithoutModifiers}})); ok {
 				// Don't invoke our own cache function
-				if typedFunc != l.cacheFunc {
-					l.subscribers = append(l.subscribers, *typedFunc)
+				if !l.ownsCacheFunc(typedFunc) {
+					l.subscribers = append(l.subscribers, {{.Name|lcFirst}}Subscriber{cacheFunc: *typedFunc, mutex: (*l.mutexRegistry)[i]})
 				}
 			}
 		}
 	})
 
-	for _, f := range l.subscribers {
-		f(value)
+	// Handling locking here (instead of in the subscribed functions themselves) isn't the
+	// ideal pattern, but it's an optimization that allows the publisher to iterate over slices
+	// without having to acquire the lock many times.
+	for _, s := range l.subscribers {
+		s.mutex.Lock()
+		{{- if .ValType.IsSliceOfPtrs }}
+		for _, v := range value {
+			if v != nil {
+				s.cacheFunc(*v)
+			}
+		}
+		{{- else if .ValType.IsPtr }}
+		if value != nil {
+			s.cacheFunc(*value)
+		}
+		{{- else if .ValType.IsSlice }}
+		for _, v := range value {
+			s.cacheFunc(v)
+		}
+		{{- else }}
+		s.cacheFunc(value)
+		{{- end }}
+		s.mutex.Unlock()
 	}
+}
+
+func (l *{{.Name}}) registerCacheFunc(cacheFunc interface{}, mutex *sync.Mutex) {
+	l.cacheFuncs = append(l.cacheFuncs, cacheFunc)
+	*l.subscriptionRegistry = append(*l.subscriptionRegistry, cacheFunc)
+	*l.mutexRegistry = append(*l.mutexRegistry, mutex)
+}
+
+func (l *{{.Name}}) ownsCacheFunc(f *func({{.ValType.StringWithoutModifiers}})) bool {
+	for _, cacheFunc := range l.cacheFuncs {
+		if cacheFunc == f {
+			return true
+		}
+	}
+
+	return false
 }
 `))
