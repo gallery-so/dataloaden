@@ -27,6 +27,8 @@ type {{.Name}}Settings interface {
 	getMaxBatchMany() int
 	getDisableCaching() bool
 	getPublishResults() bool
+	getPreFetchHook() func(context.Context) context.Context
+	getPostFetchHook() func(context.Context)
 	getSubscriptionRegistry() *[]interface{}
 	getMutexRegistry() *[]*sync.Mutex
 }
@@ -78,6 +80,14 @@ func (l *{{.Name}}) setPublishResults(publishResults bool) {
 	l.publishResults = publishResults
 }
 
+func (l *{{.Name}}) setPreFetchHook(preFetchHook func(context.Context) context.Context) {
+	l.preFetchHook = preFetchHook
+}
+
+func (l *{{.Name}}) setPostFetchHook(postFetchHook func(context.Context)) {
+	l.postFetchHook = postFetchHook
+}
+
 // New{{.Name}} creates a new {{.Name}} with the given settings, functions, and options
 func New{{.Name}}(
 	settings {{.Name}}Settings, fetch func(ctx context.Context, keys []{{.KeyType.String}}) ([]{{.ValType.String}}, []error),
@@ -90,6 +100,8 @@ func New{{.Name}}(
 		setMaxBatch(int)
 		setDisableCaching(bool)
 		setPublishResults(bool)
+		setPreFetchHook(func(context.Context) context.Context)
+		setPostFetchHook(func(context.Context))
 	}),
 	) *{{.Name}} {
 	loader := &{{.Name}}{
@@ -97,6 +109,8 @@ func New{{.Name}}(
 		wait: settings.getWait(),
 		disableCaching: settings.getDisableCaching(),
 		publishResults: settings.getPublishResults(),
+		preFetchHook: settings.getPreFetchHook(),
+		postFetchHook: settings.getPostFetchHook(),
 		subscriptionRegistry: settings.getSubscriptionRegistry(),
 		mutexRegistry: settings.getMutexRegistry(),
 		{{- if .ValType.IsSlice }}
@@ -111,7 +125,22 @@ func New{{.Name}}(
 	}
 
 	// Set this after applying options, in case a different context was set via options
-	loader.fetch = func(keys []{{.KeyType.String}}) ([]{{.ValType.String}}, []error) { return fetch(loader.ctx, keys) }
+	loader.fetch = func(keys []{{.KeyType.String}}) ([]{{.ValType.String}}, []error) {
+		ctx := loader.ctx
+
+		// Allow the preFetchHook to modify and return a new context
+		if loader.preFetchHook != nil {
+			ctx = loader.preFetchHook(ctx)
+		}
+
+		results, errors := fetch(loader.ctx, keys)
+
+		if loader.postFetchHook != nil {
+			loader.postFetchHook(ctx)
+		}
+		
+		return results, errors
+	}
 
 	if loader.subscriptionRegistry == nil {
 		panic("subscriptionRegistry may not be nil")
@@ -169,6 +198,13 @@ type {{.Name}} struct {
 
 	// whether this dataloader will publish its results for others to cache
 	publishResults bool
+
+	// a hook invoked before the fetch operation, useful for things like tracing.
+	// the returned context will be passed to the fetch operation.
+	preFetchHook func(context.Context) context.Context
+
+	// a hook invoked after the fetch operation, useful for things like tracing
+	postFetchHook func(context.Context)
 
 	// a shared slice where dataloaders will register and invoke caching functions.
 	// the same slice should be passed to every dataloader.
