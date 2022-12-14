@@ -27,8 +27,8 @@ type {{.Name}}Settings interface {
 	getMaxBatchMany() int
 	getDisableCaching() bool
 	getPublishResults() bool
-	getPreFetchHook() func(context.Context) context.Context
-	getPostFetchHook() func(context.Context)
+	getPreFetchHook() func(context.Context, string) context.Context
+	getPostFetchHook() func(context.Context, string)
 	getSubscriptionRegistry() *[]interface{}
 	getMutexRegistry() *[]*sync.Mutex
 }
@@ -80,11 +80,11 @@ func (l *{{.Name}}) setPublishResults(publishResults bool) {
 	l.publishResults = publishResults
 }
 
-func (l *{{.Name}}) setPreFetchHook(preFetchHook func(context.Context) context.Context) {
+func (l *{{.Name}}) setPreFetchHook(preFetchHook func(context.Context, string) context.Context) {
 	l.preFetchHook = preFetchHook
 }
 
-func (l *{{.Name}}) setPostFetchHook(postFetchHook func(context.Context)) {
+func (l *{{.Name}}) setPostFetchHook(postFetchHook func(context.Context, string)) {
 	l.postFetchHook = postFetchHook
 }
 
@@ -100,8 +100,8 @@ func New{{.Name}}(
 		setMaxBatch(int)
 		setDisableCaching(bool)
 		setPublishResults(bool)
-		setPreFetchHook(func(context.Context) context.Context)
-		setPostFetchHook(func(context.Context))
+		setPreFetchHook(func(context.Context, string) context.Context)
+		setPostFetchHook(func(context.Context, string))
 	}),
 	) *{{.Name}} {
 	loader := &{{.Name}}{
@@ -130,13 +130,13 @@ func New{{.Name}}(
 
 		// Allow the preFetchHook to modify and return a new context
 		if loader.preFetchHook != nil {
-			ctx = loader.preFetchHook(ctx)
+			ctx = loader.preFetchHook(ctx, "{{.Name}}")
 		}
 
 		results, errors := fetch(loader.ctx, keys)
 
 		if loader.postFetchHook != nil {
-			loader.postFetchHook(ctx)
+			loader.postFetchHook(ctx, "{{.Name}}")
 		}
 		
 		return results, errors
@@ -201,10 +201,10 @@ type {{.Name}} struct {
 
 	// a hook invoked before the fetch operation, useful for things like tracing.
 	// the returned context will be passed to the fetch operation.
-	preFetchHook func(context.Context) context.Context
+	preFetchHook func(ctx context.Context, loaderName string) context.Context
 
 	// a hook invoked after the fetch operation, useful for things like tracing
-	postFetchHook func(context.Context)
+	postFetchHook func(ctx context.Context, loaderName string)
 
 	// a shared slice where dataloaders will register and invoke caching functions.
 	// the same slice should be passed to every dataloader.
