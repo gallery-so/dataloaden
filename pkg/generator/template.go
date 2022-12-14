@@ -133,7 +133,7 @@ func New{{.Name}}(
 			ctx = loader.preFetchHook(ctx, "{{.Name}}")
 		}
 
-		results, errors := fetch(loader.ctx, keys)
+		results, errors := fetch(ctx, keys)
 
 		if loader.postFetchHook != nil {
 			loader.postFetchHook(ctx, "{{.Name}}")
